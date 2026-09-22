@@ -220,7 +220,9 @@ ninja
 
 ## Build with SYCL
 
-Using SYCL makes the computation run on the Intel GPU. Please make sure you have installed the related driver and [Intel® oneAPI Base toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit.html) before start. More details and steps can refer to [llama.cpp SYCL backend](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/SYCL.md#linux).
+Using SYCL makes the computation run on the Intel GPU. Please make sure you have installed the related driver and [Intel® oneAPI Base toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit.html) before start. More details and steps can refer to [llama.cpp SYCL backend](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/SYCL.md).
+
+### Linux
 
 ```shell
 # Export relevant ENV variables
@@ -234,3 +236,27 @@ cmake .. -DSD_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SY
 
 cmake --build . --config Release
 ```
+
+### Windows
+
+Open an activated build environment. In `cmd.exe` (adjust paths to your install):
+
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 vs2022
+```
+
+Then configure and build (Ninja recommended):
+
+```powershell
+cmake -B build_sycl -G Ninja -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx `
+  -DSD_SYCL=ON
+cmake --build build_sycl
+```
+
+### Windows runtime caveats (verified on Iris Xe iGPU)
+
+- **`GGML_SYCL_ENABLE_VMM=0` is required on devices where a single memory object must stay below 4 GiB.** The Windows driver caps iGPU Level Zero memory object at 2^32 bytes (per-object, not total). The ggml-sycl VMM pool commits one `physical_mem` block per growth and can request >= 4 GiB in one go, which fails with `could not create a memory object` inside `MUL_MAT`.
+- **Free-memory reporting is unavailable on Windows**, so the backend reports total memory as free and auto-fit may plan too much onto an iGPU. `ZES_ENABLE_SYSMAN=1` does not help here (the legacy sysman path needs the i915 kernel driver on Linux). Set a conservative budget manually if not all memory is available: `--max-vram sycl0=<GB>`.
+- **`--vae-tiling` may required for full-size VAE decode.** Without tiling, the largest VAE `IM2COL` launches exceed the int32 global-id range that the oneAPI runtime enforces at kernel submission (`Provided range and/or offset does not fit in int`).

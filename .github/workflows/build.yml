@@ -340,16 +340,26 @@ jobs:
 
     env:
       VULKAN_VERSION: 1.4.328.1
+      ONEAPI_ROOT: "C:/Program Files (x86)/Intel/oneAPI"
+      WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/b60765d1-2b85-4e85-86b6-cb0e9563a699/intel-deep-learning-essentials-2025.3.3.18_offline.exe
+      WINDOWS_ONEAPI_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common:intel.oneapi.win.mkl.devel:intel.oneapi.win.dnnl:intel.oneapi.win.tbb.devel
+      LEVEL_ZERO_SDK_URL: https://github.com/oneapi-src/level-zero/releases/download/v1.28.2/level-zero-win-sdk-1.28.2.zip
 
     strategy:
       matrix:
         include:
           - build: "cpu"
+            compiler: "cl.exe"
             defines: "-DGGML_NATIVE=OFF -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
           - build: "cuda12"
+            compiler: "cl.exe"
             defines: "-DSD_CUDA=ON -DSD_BUILD_SHARED_LIBS=ON -DCMAKE_CUDA_ARCHITECTURES='61;70;75;80;86;89;90;100;120' -DCMAKE_CUDA_FLAGS='-Xcudafe \"--diag_suppress=177\" -Xcudafe \"--diag_suppress=550\"' -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
           - build: "vulkan"
+            compiler: "cl.exe"
             defines: "-DSD_VULKAN=ON -DSD_BUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
+          - build: "sycl"
+            compiler: "icx"
+            defines: "-DSD_SYCL=ON -DSD_BUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
     steps:
       - name: Clone
         id: checkout
@@ -385,6 +395,28 @@ jobs:
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
 
+      - name: Install oneAPI
+        id: install_oneapi
+        if: ${{ matrix.build == 'sycl' }}
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri $env:WINDOWS_BASEKIT_URL -OutFile "$env:RUNNER_TEMP\oneapi.exe"
+          $p = Start-Process -FilePath "$env:RUNNER_TEMP\oneapi.exe" -ArgumentList @(
+            '-s', '-x', '--action', 'install',
+            "--components=$env:WINDOWS_ONEAPI_COMPONENTS",
+            '--install-dir=C:\Program Files (x86)\Intel\oneAPI',
+            "--log=$env:RUNNER_TEMP\oneapi-install.log"
+          ) -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { Get-Content "$env:RUNNER_TEMP\oneapi-install.log" -Tail 100; throw "oneAPI install failed with exit code $($p.ExitCode)" }
+
+      - name: Install Level Zero SDK
+        if: ${{ matrix.build == 'sycl' }}
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "${{ env.LEVEL_ZERO_SDK_URL }}" -OutFile "$env:RUNNER_TEMP\level-zero-win-sdk.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\level-zero-win-sdk.zip" -DestinationPath "C:/level-zero-sdk" -Force
+          Add-Content $env:GITHUB_ENV "LEVEL_ZERO_V1_SDK_PATH=C:/level-zero-sdk"
+
       - name: Activate MSVC environment
         id: msvc_dev_cmd
         uses: ilammy/msvc-dev-cmd@v1
@@ -392,9 +424,14 @@ jobs:
       - name: Build
         id: cmake_build
         run: |
+          if ("${{ matrix.build }}" -eq "sycl") {
+            cmd /c "`"${{ env.ONEAPI_ROOT }}\setvars.bat`" intel64 --force && set" | ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+            }
+          }
           mkdir build
           cd build
-          cmake .. -DCMAKE_CXX_FLAGS='/bigobj' -G Ninja -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe -DCMAKE_BUILD_TYPE=Release ${{ matrix.defines }}
+          cmake .. -DCMAKE_CXX_FLAGS='/bigobj' -G Ninja -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DCMAKE_BUILD_TYPE=Release ${{ matrix.defines }}
           cmake --build .
 
       - name: Get commit hash
@@ -438,6 +475,72 @@ jobs:
           name: sd-cudart-sd-bin-win-cu12-x64.zip
           path: |
             cudart-sd-bin-win-cu12-x64.zip
+
+      - name: Copy and pack oneAPI runtime
+        id: pack_oneapi_runtime
+        if: ${{ matrix.build == 'sycl' && (github.event_name == 'push' && github.ref == 'refs/heads/master' || github.event.inputs.create_release == 'true') }}
+        shell: pwsh
+        run: |
+          $root = $env:ONEAPI_ROOT
+          $dst = "./oneapi-runtime"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+          function Copy-Required([string]$pattern) {
+            $items = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue
+            if (-not $items) { throw "required runtime file not found: $pattern" }
+            $items | Copy-Item -Destination $dst
+            Write-Host "copied: $($items.Name -join ', ')"
+          }
+          function Copy-Optional([string]$pattern) {
+            $items = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue
+            if ($items) { $items | Copy-Item -Destination $dst; Write-Host "copied: $($items.Name -join ', ')" }
+            else { Write-Host "not found, skipping: $pattern" }
+          }
+
+          # SYCL runtime + device SPIR-V modules + Unified Runtime adapters
+          Copy-Required "$root/compiler/latest/bin/sycl?.dll"
+          Copy-Required "$root/compiler/latest/bin/svml_dispmd.dll"
+          Copy-Required "$root/compiler/latest/bin/libmmd.dll"
+          Copy-Required "$root/compiler/latest/bin/libiomp5md.dll"
+          Copy-Required "$root/compiler/latest/bin/ur_loader.dll"
+          Copy-Required "$root/compiler/latest/bin/ur_win_proxy_loader.dll"
+          Copy-Required "$root/compiler/latest/bin/ur_adapter_level_zero*.dll"
+          Copy-Required "$root/compiler/latest/bin/ur_adapter_opencl.dll"
+          Copy-Required "$root/compiler/latest/bin/libsycl-*.spv"
+          Copy-Required "$root/compiler/latest/bin/sycl-ls.exe"
+
+          # MKL GPU BLAS; mkl_core loads CPU-specific function libs dynamically at runtime
+          Copy-Required "$root/mkl/latest/bin/mkl_sycl_blas.*.dll"
+          Copy-Required "$root/mkl/latest/bin/mkl_core.*.dll"
+          Copy-Required "$root/mkl/latest/bin/mkl_tbb_thread.*.dll"
+          Copy-Required "$root/mkl/latest/bin/mkl_intel_thread.*.dll"
+          Copy-Required "$root/mkl/latest/bin/mkl_def.*.dll"
+          Copy-Required "$root/mkl/latest/bin/mkl_avx2.*.dll"
+          Copy-Required "$root/mkl/latest/bin/mkl_avx512.*.dll"
+          Copy-Required "$root/mkl/latest/bin/mkl_mc3.*.dll"
+          Copy-Optional "$root/mkl/latest/bin/mkl_vml_*.dll"
+
+          Copy-Required "$root/tbb/latest/bin/tbb12.dll"
+          Copy-Optional "$root/dnnl/latest/bin/dnnl.dll"
+          Copy-Optional "$root/tcm/latest/bin/tcm.dll"
+          Copy-Optional "$root/tcm/latest/bin/libhwloc-*.dll"
+          Copy-Optional "$root/umf/latest/bin/umf.dll"
+
+          # ze_loader: prefer the pinned Level Zero SDK, fall back to oneAPI tree
+          $ze = Get-ChildItem -Path "$env:LEVEL_ZERO_V1_SDK_PATH" -Recurse -Filter ze_loader.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $ze) { $ze = Get-ChildItem -Path $root -Recurse -Filter ze_loader.dll -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          if ($ze) { Copy-Item $ze.FullName $dst; Write-Host "copied ze_loader.dll from $($ze.DirectoryName)" }
+          else { Write-Host "ze_loader.dll not found; relying on system driver runtime" }
+
+          7z a oneapi-sd-bin-win-sycl-x64.zip $dst/*
+
+      - name: Upload oneAPI runtime
+        if: ${{ matrix.build == 'sycl' && (github.event_name == 'push' && github.ref == 'refs/heads/master' || github.event.inputs.create_release == 'true') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sd-oneapi-sd-bin-win-sycl-x64.zip
+          path: |
+            oneapi-sd-bin-win-sycl-x64.zip
 
       - name: Upload artifacts
         if: ${{ ( github.event_name == 'push' && github.ref == 'refs/heads/master' ) || github.event.inputs.create_release == 'true' }}
