@@ -193,6 +193,7 @@ jobs:
       artifact-metadata: write
 
     strategy:
+      fail-fast: false
       matrix:
         variant: [musa, sycl, vulkan, cuda]
         platform: [linux/amd64]
@@ -346,6 +347,7 @@ jobs:
       LEVEL_ZERO_SDK_URL: https://github.com/oneapi-src/level-zero/releases/download/v1.28.2/level-zero-win-sdk-1.28.2.zip
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - build: "cpu"
@@ -358,8 +360,18 @@ jobs:
             compiler: "cl.exe"
             defines: "-DSD_VULKAN=ON -DSD_BUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
           - build: "sycl"
-            compiler: "icx"
-            defines: "-DSD_SYCL=ON -DSD_BUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON"
+            compiler: "icx.exe"
+            # note: no GGML_CPU_ALL_VARIANTS - ggml-cpu/CMakeLists.txt only adds
+            #       -mavx512vnni/-mavx512vbmi/-mavx512bf16 when the C compiler id
+            #       is "Clang", but icx reports "IntelLLVM", so AVX512 variant
+            #       targets fail on repack.cpp/quants intrinsics.
+            #       To re-enable: change the three
+            #       `CMAKE_C_COMPILER_ID STREQUAL "Clang"` checks in
+            #       ggml/src/ggml-cpu/CMakeLists.txt (AVX512 VBMI/VNNI/BF16 block)
+            #       to `CMAKE_C_COMPILER_ID MATCHES "^(Clang|IntelLLVM)$"`
+            #       (ideally as an upstream PR), then add
+            #       -DGGML_CPU_ALL_VARIANTS=ON back here.
+            defines: "-DSD_SYCL=ON -DSD_BUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_REPACK=OFF"
     steps:
       - name: Clone
         id: checkout
@@ -400,14 +412,37 @@ jobs:
         if: ${{ matrix.build == 'sycl' }}
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri $env:WINDOWS_BASEKIT_URL -OutFile "$env:RUNNER_TEMP\oneapi.exe"
-          $p = Start-Process -FilePath "$env:RUNNER_TEMP\oneapi.exe" -ArgumentList @(
-            '-s', '-x', '--action', 'install',
-            "--components=$env:WINDOWS_ONEAPI_COMPONENTS",
-            '--install-dir=C:\Program Files (x86)\Intel\oneAPI',
-            "--log=$env:RUNNER_TEMP\oneapi-install.log"
-          ) -Wait -PassThru -NoNewWindow
-          if ($p.ExitCode -ne 0) { Get-Content "$env:RUNNER_TEMP\oneapi-install.log" -Tail 100; throw "oneAPI install failed with exit code $($p.ExitCode)" }
+          # Follows Intel's official install_windows.bat: the offline exe is only
+          # a web-image extractor (-s -x -f --log); the actual install runs via
+          # the extracted bootstrapper.exe (--action install --components ...).
+          $extract = "$env:RUNNER_TEMP\webimage_extracted"
+          Invoke-WebRequest -Uri $env:WINDOWS_BASEKIT_URL -OutFile "$env:RUNNER_TEMP\webimage.exe"
+          & "$env:RUNNER_TEMP\webimage.exe" -s -x -f $extract --log "$env:RUNNER_TEMP\extract.log" | Out-Null
+          $extract_code = $LASTEXITCODE
+          Remove-Item "$env:RUNNER_TEMP\webimage.exe" -Force
+          if ($extract_code -ne 0) {
+            Get-Content "$env:RUNNER_TEMP\extract.log" -Tail 100 -ErrorAction Continue
+            throw "web-image extraction failed with exit code $extract_code"
+          }
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\oneapi-logs" | Out-Null
+          & "$extract\bootstrapper.exe" -s --action install `
+            "--components=$env:WINDOWS_ONEAPI_COMPONENTS" --eula=accept `
+            -p=NEED_VS2017_INTEGRATION=0 -p=NEED_VS2019_INTEGRATION=0 -p=NEED_VS2022_INTEGRATION=0 `
+            --log-dir="$env:RUNNER_TEMP\oneapi-logs" | Out-Null
+          $installer_exit_code = $LASTEXITCODE
+          Remove-Item -Recurse -Force $extract -ErrorAction Continue
+          if ($installer_exit_code -ne 0) {
+            Get-ChildItem "$env:RUNNER_TEMP\oneapi-logs" -Recurse -File | ForEach-Object {
+              Write-Host "=== $($_.FullName) ==="; Get-Content $_.FullName -Tail 50
+            }
+            throw "oneAPI install failed with exit code $installer_exit_code"
+          }
+          # Verify the install: setvars.bat only mutates the child cmd process,
+          # so re-import its environment like the Build step does, then probe icx.
+          cmd /c "`"$env:ONEAPI_ROOT\setvars.bat`" intel64 --force && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+          }
+          icx --version
 
       - name: Install Level Zero SDK
         if: ${{ matrix.build == 'sycl' }}
@@ -431,7 +466,7 @@ jobs:
           }
           mkdir build
           cd build
-          cmake .. -DCMAKE_CXX_FLAGS='/bigobj' -G Ninja -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DCMAKE_BUILD_TYPE=Release ${{ matrix.defines }}
+          cmake .. -DCMAKE_CXX_FLAGS='/bigobj /EHsc' -G Ninja "-DCMAKE_C_COMPILER=cl.exe" "-DCMAKE_CXX_COMPILER=${{ matrix.compiler }}" -DCMAKE_BUILD_TYPE=Release ${{ matrix.defines }}
           cmake --build .
 
       - name: Get commit hash
@@ -683,6 +718,7 @@ jobs:
       UBUNTU_VERSION: "24.04"
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           - ROCM_VERSION: "7.14.0"
