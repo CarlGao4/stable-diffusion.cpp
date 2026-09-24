@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <list>
 #include <mutex>
 #include <set>
@@ -2355,6 +2357,36 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                                                         : sampling_init_latent;
     sd::Tensor<float> denoised                    = x_t;
 
+    // Debug-only: when SD_DEBUG_DUMP_DIR is set, write each latent state as raw f32
+    // (header format matches sd::load_tensor_from_file_as_tensor) for offline
+    // spectral analysis. No-op when the variable is unset.
+    static const char* sd_debug_dump_dir = getenv("SD_DEBUG_DUMP_DIR");
+    auto dump_latent                     = [&](const char* what, int st, const sd::Tensor<float>& t) {
+        if (sd_debug_dump_dir == nullptr || sd_debug_dump_dir[0] == '\0' || t.empty()) {
+            return;
+        }
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/latent_%s_step%03d.bin", sd_debug_dump_dir, what, std::abs(st));
+        std::ofstream f(path, std::ios::binary);
+        if (!f.is_open()) {
+            LOG_WARN("cannot open latent dump '%s'", path);
+            return;
+        }
+        const std::vector<int64_t>& shp = t.shape();
+        int32_t n_dims                  = (int32_t)shp.size();
+        int32_t length                  = 0;
+        int32_t ttype                   = (int32_t)GGML_TYPE_F32;
+        f.write((const char*)&n_dims, sizeof(n_dims));
+        f.write((const char*)&length, sizeof(length));
+        f.write((const char*)&ttype, sizeof(ttype));
+        for (int64_t d : shp) {
+            int32_t dim = (int32_t)d;
+            f.write((const char*)&dim, sizeof(dim));
+        }
+        f.write((const char*)t.data(), (std::streamsize)(t.numel() * sizeof(float)));
+    };
+    dump_latent("x0_init", 0, x_t);
+
     auto denoise = [&](const sd::Tensor<float>& x, float sigma, int step) -> sd::guidance::GuiderOutput {
         if (get_cancel_flag() == SD_CANCEL_ALL) {
             LOG_VERBOSE("cancelling generation");
@@ -2653,6 +2685,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             preview_image(step, denoised, version, preview.mode, preview.callback, preview.data, false);
         }
         report_sample_progress(step, steps, terminal_sigma_is_zero, &last_progress_us);
+        dump_latent("x_in", step, x);
+        dump_latent("x0", step, denoised);
         output.pred = denoised;
         return output;
     };
