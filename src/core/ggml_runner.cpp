@@ -1,5 +1,8 @@
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <map>
 #include <utility>
 
@@ -820,7 +823,34 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
                 continue;
             }
             auto debug_tensor = make_sd_tensor_from_ggml<float>(tensor);
-            print_sd_tensor(debug_tensor, false, entry.second.c_str());
+            const char* layer_dump_dir = getenv("SD_DEBUG_DUMP_LAYERS");
+            if (layer_dump_dir != nullptr && layer_dump_dir[0] != '\0') {
+                // Write the same raw-f32 layout as the SD_DEBUG_DUMP_DIR latent
+                // dumps (int32 n_dims, name_len=0, type=0, dims in ggml ne order,
+                // then f32 data) so offline tooling can read either interchangeably.
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/%s.bin", layer_dump_dir, entry.second.c_str());
+                std::ofstream out(path, std::ios::binary);
+                if (out.is_open()) {
+                    const std::vector<int64_t>& shp = debug_tensor.shape();
+                    int32_t n_dims                  = (int32_t)shp.size();
+                    int32_t length                  = 0;
+                    int32_t ttype                   = (int32_t)GGML_TYPE_F32;
+                    out.write((const char*)&n_dims, sizeof(n_dims));
+                    out.write((const char*)&length, sizeof(length));
+                    out.write((const char*)&ttype, sizeof(ttype));
+                    for (int64_t d : shp) {
+                        int32_t dim = (int32_t)d;
+                        out.write((const char*)&dim, sizeof(dim));
+                    }
+                    out.write((const char*)debug_tensor.data(),
+                              (std::streamsize)(debug_tensor.numel() * sizeof(float)));
+                } else {
+                    LOG_WARN("cannot open layer dump '%s'", path);
+                }
+            } else {
+                print_sd_tensor(debug_tensor, false, entry.second.c_str());
+            }
         }
     }
 

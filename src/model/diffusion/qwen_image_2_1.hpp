@@ -323,6 +323,43 @@ namespace Qwen {
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* timestep, ggml_tensor* context, const std::vector<ggml_tensor*>& refs, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
+            // Debug-only per-layer activation capture for cross-implementation
+            // comparison against diffusers. Active only when SD_DEBUG_DUMP_LAYERS
+            // is set; dumps the full joint stream of each block plus the raw text
+            // conditioning, at the forward call numbered SD_DEBUG_DUMP_LAYER_STEP
+            // (1-based; default = every call). Read back after compute via debug_tensors.
+            static const char* layer_dump       = getenv("SD_DEBUG_DUMP_LAYERS");
+            static const int64_t layer_dump_at  = layer_dump != nullptr && layer_dump[0] != '\0'
+                                                      ? (getenv("SD_DEBUG_DUMP_LAYER_STEP") != nullptr ? atoll(getenv("SD_DEBUG_DUMP_LAYER_STEP")) : 0)
+                                                      : -1;
+            static const std::vector<int> layer_dump_only = [] {
+                std::vector<int> only;
+                const char* spec = getenv("SD_DEBUG_DUMP_LAYER_ONLY");
+                if (spec != nullptr) {
+                    std::stringstream ss(spec);
+                    std::string item;
+                    while (std::getline(ss, item, ',')) {
+                        if (!item.empty()) {
+                            only.push_back(atoi(item.c_str()));
+                        }
+                    }
+                }
+                return only;
+            }();
+            static int64_t layer_dump_call      = 0;
+            if (layer_dump != nullptr && layer_dump[0] != '\0' && cache.mode != QwenImage21PrefixCache::Mode::REUSE) {
+                ++layer_dump_call;
+            }
+            const bool dump_this_layer = [&](int i) {
+                return layer_dump_only.empty() ||
+                       std::find(layer_dump_only.begin(), layer_dump_only.end(), i) != layer_dump_only.end();
+            };
+            const bool do_layer_dump = layer_dump != nullptr && layer_dump[0] != '\0' &&
+                                       cache.mode != QwenImage21PrefixCache::Mode::REUSE &&
+                                       (layer_dump_at <= 0 || layer_dump_call == layer_dump_at);
+            if (do_layer_dump && context != nullptr) {
+                ctx->capture_tensor("qwen21_te_context", context);
+            }
             auto time = ggml_concat(ctx->ggml_ctx, timestep, ggml_ext_zeros_like(ctx->ggml_ctx, timestep), 0);
             // Runtime flow timesteps already use the [0, 1000] scale.
             time               = ggml_ext_timestep_embedding(ctx->ggml_ctx, time, 256, 10000, 1.f);
@@ -356,6 +393,9 @@ namespace Qwen {
                 layer_cache.cut_group   = "qwen_image_2_1." + layer;
                 auto block              = std::dynamic_pointer_cast<QwenImage21TransformerBlock>(blocks[layer]);
                 joint                   = block->forward(ctx, joint, mod, pe, layout, masks, layer_cache);
+                if (do_layer_dump && dump_this_layer(i)) {
+                    ctx->capture_tensor("qwen21_layer_" + std::to_string(i), joint);
+                }
                 sd::ggml_graph_cut::mark_graph_cut(joint, layer_cache.cut_group, "joint");
             }
             if (cache.mode != QwenImage21PrefixCache::Mode::REUSE) {
