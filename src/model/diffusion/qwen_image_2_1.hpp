@@ -1,6 +1,13 @@
 #ifndef __SD_MODEL_DIFFUSION_QWEN_IMAGE_2_1_H__
 #define __SD_MODEL_DIFFUSION_QWEN_IMAGE_2_1_H__
 
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
 #include "model/diffusion/qwen_image.hpp"
 
 namespace Qwen {
@@ -350,7 +357,7 @@ namespace Qwen {
             if (layer_dump != nullptr && layer_dump[0] != '\0' && cache.mode != QwenImage21PrefixCache::Mode::REUSE) {
                 ++layer_dump_call;
             }
-            const bool dump_this_layer = [&](int i) {
+            const auto dump_this_layer = [&](int i) {
                 return layer_dump_only.empty() ||
                        std::find(layer_dump_only.begin(), layer_dump_only.end(), i) != layer_dump_only.end();
             };
