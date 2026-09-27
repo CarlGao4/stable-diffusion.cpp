@@ -173,11 +173,13 @@ enum lora_apply_mode_t {
 typedef struct {
     bool enabled;
     bool temporal_tiling;
-    int tile_size_x;
-    int tile_size_y;
+    // Spatial tile dimensions in image pixels for both encode and decode; 0 uses 256.
+    int tile_size_w;
+    int tile_size_h;
     float target_overlap;
-    float rel_size_x;
-    float rel_size_y;
+    // Positive values override tile_size: <= 1 is a dimension fraction, > 1 a target tile count.
+    float rel_size_w;
+    float rel_size_h;
     const char* extra_tiling_args;
 } sd_tiling_params_t;
 
@@ -559,6 +561,8 @@ SD_API bool upscale(upscaler_ctx_t* upscaler_ctx,
                     int* num_images_out);
 
 SD_API int get_upscale_factor(upscaler_ctx_t* upscaler_ctx);
+// Reads model metadata only; returns 0 if the file is not a recognized RGB ESRGAN model.
+SD_API int get_upscaler_model_scale(const char* model_path);
 
 typedef struct adetailer_ctx_t adetailer_ctx_t;
 

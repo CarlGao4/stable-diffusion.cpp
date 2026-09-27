@@ -107,6 +107,7 @@ const char* model_version_to_str[] = {
     "SenseNova U1.5",
     "LLaDA-Image",
     "ESRGAN",
+    "PixArt",
 };
 
 static_assert(VERSION_COUNT == sizeof(model_version_to_str) / sizeof(model_version_to_str[0]),
@@ -123,6 +124,18 @@ void calculate_alphas_cumprod(float* alphas_cumprod,
     for (int i = 0; i < timesteps; i++) {
         float beta = ls_sqrt + amount * ((float)i / (timesteps - 1));
         product *= 1.0f - powf(beta, 2.0f);
+        alphas_cumprod[i] = product;
+    }
+}
+
+void calculate_alphas_cumprod_linear_beta(float* alphas_cumprod,
+                                          float beta_start,
+                                          float beta_end,
+                                          int timesteps = TIMESTEPS) {
+    float product = 1.0f;
+    for (int i = 0; i < timesteps; i++) {
+        float beta = beta_start + (beta_end - beta_start) * ((float)i / (timesteps - 1));
+        product *= 1.0f - beta;
         alphas_cumprod[i] = product;
     }
 }
@@ -668,6 +681,10 @@ void StableDiffusionGGML::refresh_compvis_denoiser_sigmas() {
     std::vector<float> alphas_cumprod(TIMESTEPS);
     if (file_alphas_cumprod.size() == TIMESTEPS) {
         alphas_cumprod = file_alphas_cumprod;
+    } else if (sd_version_is_pixart(version)) {
+        // PixArt checkpoints train with a linear beta schedule (0.0001 -> 0.02)
+        // instead of the scaled_linear schedule used by SD1.x/SDXL.
+        calculate_alphas_cumprod_linear_beta(alphas_cumprod.data(), 0.0001f, 0.02f);
     } else {
         calculate_alphas_cumprod(alphas_cumprod.data());
     }
@@ -2473,6 +2490,7 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                                 timesteps_tensor,
                                 cond,
                                 &controls);
+        bool uncond_controls_ready = false;
 
         static const std::vector<sd::Tensor<float>> empty_ref_latents;
         bool uncond_without_ref_latents = !img_uncond.empty() &&
@@ -2562,6 +2580,17 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                 return std::move(cached_output);
             }
 
+            // A re-enabled condition can miss the cache even when the positive pass was reused.
+            if (!uncond_controls_ready && !uncond.empty() &&
+                (&condition == &uncond || &condition == &img_uncond)) {
+                compute_sample_controls(control_image,
+                                        noised_input,
+                                        timesteps_tensor,
+                                        uncond,
+                                        &controls);
+                uncond_controls_ready = true;
+            }
+
             for (const auto& extension : generation_extensions) {
                 extension->before_diffusion(diffusion_params, step);
             }
@@ -2601,41 +2630,69 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             }
         }
 
+        float effective_guidance_scale = guidance_schedule.empty()
+                                             ? cfg_scale
+                                             : guidance_schedule[guidance_schedule.size() - 1 - step];
+
+        float image_guidance_scale = img_cfg_scale;
+
+        constexpr float kEpsilon = 1e-5f;
+
+        bool skip_uncond = false;
+        if (!uncond.empty() && !needs_uncond_denoised && !use_apg_guidance) {
+            if (!img_uncond.empty()) {
+                skip_uncond = std::abs(image_guidance_scale - effective_guidance_scale) < kEpsilon;
+            } else {
+                skip_uncond = std::abs(effective_guidance_scale - 1.0f) < kEpsilon;
+            }
+        }
+
+        bool skip_img_uncond = false;
+        if (!img_uncond.empty() && !needs_uncond_denoised && !use_apg_guidance) {
+            if (!uncond.empty()) {
+                skip_img_uncond = std::abs(image_guidance_scale - 1.0f) < kEpsilon;
+            } else {
+                skip_img_uncond = std::abs(effective_guidance_scale - 1.0f) < kEpsilon;
+            }
+        }
+
         cond_out = run_condition(*positive_condition, c_concat_override);
         if (cond_out.empty()) {
             return {};
         }
 
         if (!uncond.empty()) {
-            if (!step_cache.is_step_skipped()) {
-                compute_sample_controls(control_image,
-                                        noised_input,
-                                        timesteps_tensor,
-                                        uncond,
-                                        &controls);
-            }
-            const std::vector<int>* uncond_skip_layers = nullptr;
-            if (is_skiplayer_step && slg_uncond) {
-                LOG_VERBOSE("Skipping layers at uncond step %d\n", step);
-                uncond_skip_layers = &skip_layer_guidance.layers();
-            }
-            uncond_out = run_condition(uncond,
-                                       uncond.c_concat.empty() ? nullptr : &uncond.c_concat,
-                                       uncond_skip_layers,
-                                       nullptr,
-                                       true);
-            if (uncond_out.empty()) {
-                return {};
+            if (!skip_uncond) {
+                const std::vector<int>* uncond_skip_layers = nullptr;
+                if (is_skiplayer_step && slg_uncond) {
+                    LOG_VERBOSE("Skipping layers at uncond step %d\n", step);
+                    uncond_skip_layers = &skip_layer_guidance.layers();
+                }
+                uncond_out = run_condition(uncond,
+                                           uncond.c_concat.empty() ? nullptr : &uncond.c_concat,
+                                           uncond_skip_layers,
+                                           nullptr,
+                                           true);
+                if (uncond_out.empty()) {
+                    return {};
+                }
+            } else {
+                step_cache.invalidate_condition(&uncond);
             }
         }
+
         if (!img_uncond.empty()) {
-            img_uncond_out = run_condition(img_uncond,
-                                           img_uncond.c_concat.empty() ? nullptr : &img_uncond.c_concat,
-                                           nullptr,
-                                           uncond_without_ref_latents ? &empty_ref_latents : nullptr,
-                                           true);
-            if (img_uncond_out.empty()) {
-                return {};
+            if (!skip_img_uncond) {
+                img_uncond_out = run_condition(img_uncond,
+                                               img_uncond.c_concat.empty() ? nullptr : &img_uncond.c_concat,
+                                               nullptr,
+                                               uncond_without_ref_latents ? &empty_ref_latents : nullptr,
+                                               true);
+                if (img_uncond_out.empty()) {
+                    return {};
+                }
+            } else {
+                step_cache.invalidate_condition(&img_uncond);
             }
         }
         sd::guidance::GuidanceInput guidance_input;
@@ -2645,7 +2702,7 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
         guidance_input.pred_uncond     = uncond_out.empty() ? nullptr : &uncond_out;
         guidance_input.pred_img_uncond = img_uncond_out.empty() ? nullptr : &img_uncond_out;
 
-        sd::guidance::GuiderOutput guided = guidance_schedule.empty() ? primary_guidance.forward(guidance_input, {}) : primary_guidance.forward(guidance_input, {}, guidance_schedule[guidance_schedule.size() - 1 - step]);
+        sd::guidance::GuiderOutput guided = primary_guidance.forward(guidance_input, {}, effective_guidance_scale);
         if (guided.pred.empty()) {
             return {};
         }
@@ -2725,7 +2782,7 @@ int StableDiffusionGGML::get_diffusion_model_down_factor() {
     if (sd_version_is_dit(version)) {
         if (sd_version_is_sensenova_u1(version)) {
             down_factor = 32;
-        } else if (version == VERSION_QWEN_IMAGE_2_1 || sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_minimax_h3(version)) {
+        } else if (version == VERSION_QWEN_IMAGE_2_1 || sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_minimax_h3(version) || sd_version_is_pixart(version)) {
             down_factor = 2;
         } else {
             down_factor = 1;
@@ -2763,6 +2820,8 @@ int StableDiffusionGGML::get_latent_channel() {
             latent_channel = 128;
         } else if (sd_version_is_mage_flow(version)) {
             latent_channel = 128;
+        } else if (sd_version_is_pixart(version)) {
+            latent_channel = 4;
         } else {
             latent_channel = 16;
         }
@@ -2858,14 +2917,26 @@ sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float
         return sd::ops::clamp((x + 1.f) * 0.5f, 0.0f, 1.0f);
     }
     auto latents                      = first_stage_model->diffusion_to_vae_latents(x);
-    auto decoded                      = first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
-    const bool prefer_temporal_tiling = decode_video && first_stage_model->can_temporal_tile_decode();
-    while (decoded.empty() &&
-           sd::backend_fit::prepare_vae_decode_retry_tiling(vae_tiling_params, prefer_temporal_tiling,
-                                                            first_stage_model->last_compute_status())) {
-        decoded = first_stage_model->decode(n_threads, latents, vae_tiling_params, decode_video, circular_x, circular_y);
+    auto tiling_params                = first_stage_model->resolve_tiling_params(vae_tiling_params);
+    const bool prefer_temporal_tiling = decode_video && latents.dim() == 5 && latents.shape()[2] > 1 &&
+                                        first_stage_model->can_temporal_tile_decode();
+    for (;;) {
+        int tile_size_w = static_cast<int>(latents.shape()[0]);
+        int tile_size_h = static_cast<int>(latents.shape()[1]);
+        float tile_overlap;
+        if (tiling_params.enabled &&
+            !first_stage_model->get_tile_sizes(tile_size_w, tile_size_h, tile_overlap, tiling_params,
+                                               latents.shape()[0], latents.shape()[1])) {
+            return {};
+        }
+        auto decoded = first_stage_model->decode(n_threads, latents, tiling_params, decode_video, circular_x, circular_y);
+        if (!decoded.empty() ||
+            !sd::backend_fit::prepare_vae_decode_retry_tiling(tiling_params, prefer_temporal_tiling,
+                                                              first_stage_model->last_compute_status(),
+                                                              tile_size_w, tile_size_h, first_stage_model->get_scale_factor())) {
+            return decoded;
+        }
     }
-    return decoded;
 }
 
 sd::Tensor<float> StableDiffusionGGML::normalize_ltx_video_latents(const sd::Tensor<float>& x) {
