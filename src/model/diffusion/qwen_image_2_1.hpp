@@ -331,11 +331,13 @@ namespace Qwen {
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* timestep, ggml_tensor* context, const std::vector<ggml_tensor*>& refs, ggml_tensor* pe, const QwenImage21Layout& layout, const std::vector<ggml_tensor*>& masks, const QwenImage21PrefixCache& cache) {
             // Debug-only per-layer activation capture for cross-implementation
-            // comparison against diffusers. Active only when SD_DEBUG_DUMP_LAYERS
-            // is set; dumps the full joint stream of each block plus the raw text
-            // conditioning, at the forward call numbered SD_DEBUG_DUMP_LAYER_STEP
-            // (1-based; default = every call). Read back after compute via debug_tensors.
-            static const char* layer_dump       = getenv("SD_DEBUG_DUMP_LAYERS");
+            // comparison against diffusers. SD_DEBUG_DUMP_DIR is the single master
+            // switch (same dir the per-step latent dumps use); when set, the runner
+            // writes each captured tensor there as raw f32. SD_DEBUG_DUMP_LAYER_STEP
+            // (1-based) picks which forward call dumps, 0 = every call;
+            // SD_DEBUG_DUMP_LAYER_ONLY lists block indices. Captures the full joint
+            // stream of each listed block plus the raw text conditioning.
+            static const char* layer_dump       = getenv("SD_DEBUG_DUMP_DIR");
             static const int64_t layer_dump_at  = layer_dump != nullptr && layer_dump[0] != '\0'
                                                       ? (getenv("SD_DEBUG_DUMP_LAYER_STEP") != nullptr ? atoll(getenv("SD_DEBUG_DUMP_LAYER_STEP")) : 0)
                                                       : -1;

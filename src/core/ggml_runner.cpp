@@ -823,7 +823,10 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
                 continue;
             }
             auto debug_tensor = make_sd_tensor_from_ggml<float>(tensor);
-            const char* layer_dump_dir = getenv("SD_DEBUG_DUMP_LAYERS");
+            // SD_DEBUG_DUMP_DIR is the master switch (also gates the model-side
+            // capture); layer dumps land in the same dir as the per-step latent
+            // dumps written by the diffusion engine.
+            const char* layer_dump_dir = getenv("SD_DEBUG_DUMP_DIR");
             if (layer_dump_dir != nullptr && layer_dump_dir[0] != '\0') {
                 // Write the same raw-f32 layout as the SD_DEBUG_DUMP_DIR latent
                 // dumps (int32 n_dims, name_len=0, type=0, dims in ggml ne order,
